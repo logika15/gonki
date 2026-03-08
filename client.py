@@ -1,233 +1,221 @@
 import customtkinter as ctk
-import socket, threading, json
+import socket, threading, json, time
 from PIL import Image, ImageTk
+import pygame
 
 class Game(ctk.CTk):
     def __init__(self):
         super().__init__()
-        self.geometry("1000x700")
-        
-        # 1. ПІДКЛЮЧЕННЯ
+        self.title("Гонки")
+        self.geometry("1100x850")
+
+        pygame.mixer.init()
+
+        # сеть
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         try:
             self.sock.connect(('127.0.0.1', 5555))
-            self.my_id = self.sock.recv(1024).decode()
+            self.my_id = self.sock.recv(1024).decode().strip()
         except:
-            print("ПОМИЛКА: Спочатку запусти server.py!"); return
+            print("Сервер не найден")
+            self.destroy()
+            return
 
-        self.players = {}
-        
-        # 2. МАЛЮЄМО ТРАСУ
-        self.cv = ctk.CTkCanvas(self, width=950, height=650, bg="#222")
-        self.cv.pack(pady=20)
-        # Біла дорога (прямокутник)
-        self.cv.create_rectangle(50, 50, 900, 600, outline="white", width=60)
+        self.players_data = {}
+        self.game_started = False
+        self.finished = False
 
-        # 3. МАШИНКИ
+        # управление
+        self.pressed_keys = set()
+
+        # круги
+        self.laps = 0
+        self.max_laps = 25
+
+        # зоны круга
+        self.zone_down = False
+        self.zone_right = False
+        self.zone_up = False
+        self.zone_finish = False
+        self.prev_y = 0  # для проверки пересечения сверху вниз
+
+        # физика
+        self.vx = 0
+        self.vy = 0
+        self.friction = 0.92
+        self.speed = 2
+
+        # поле
+        self.cv = ctk.CTkCanvas(self,width=1000,height=750,bg="white",highlightthickness=0)
+        self.cv.pack(pady=10)
+
+        # трасса
+        self.road = self.cv.create_rectangle(150,150,850,600,outline="black",width=160)
+
+        # старт
+        self.cv.create_text(230,120,text="СТАРТ",font=("Arial",20,"bold"),fill="green")
+        self.cv.create_line(150,200,310,200,fill="green",width=5)
+
+        # финиш
+        self.finish_y = 550
+        self.cv.create_text(770,630,text="ФІНІШ",font=("Arial",20,"bold"),fill="red")
+        self.cv.create_line(690,self.finish_y,850,self.finish_y,fill="red",width=8,dash=(5,5))
+
+        # лейбл кругов
+        self.lap_label = self.cv.create_text(
+            500,50,
+            text=f"Круг: {self.laps}/{self.max_laps}",
+            font=("Arial",25,"bold")
+        )
+
+        # машины
+        self.start_pos = {
+            "0":{"x":200,"y":170,"angle":0},
+            "1":{"x":260,"y":170,"angle":0}
+        }
+
         try:
-            img1 = ImageTk.PhotoImage(Image.open("МАШЫНА-removebg-preview.png").resize((40, 25)))
-            img2 = ImageTk.PhotoImage(Image.open("depositphotos_83377494-stock-illustration-yellow-car-top-view-removebg-preview.png").resize((40, 25)))
-            self.p0 = self.cv.create_image(50, 80, image=img1)
-            self.p1 = self.cv.create_image(50, 120, image=img2)
-            self.img_ref = [img1, img2] # Щоб Python не видалив картинки з пам'яті
+            self.img_g=Image.open("car_green.png").resize((70,35))
+            self.img_y=Image.open("car_yellow.png").resize((70,35))
+            self.tk_g=ImageTk.PhotoImage(self.img_g)
+            self.tk_y=ImageTk.PhotoImage(self.img_y)
+            self.p0=self.cv.create_image(200,170,image=self.tk_g)
+            self.p1=self.cv.create_image(260,170,image=self.tk_y)
         except:
-            self.p0 = self.cv.create_rectangle(140, 70, 170, 90, fill="red")
-            self.p1 = self.cv.create_rectangle(140, 110, 170, 130, fill="blue")
+            self.p0=self.cv.create_rectangle(190,160,210,180,fill="green")
+            self.p1=self.cv.create_rectangle(250,160,270,180,fill="yellow")
 
-        self.bind("<KeyPress>", self.move)
-        threading.Thread(target=self.listen, daemon=True).start()
+        self.msg_label = self.cv.create_text(
+            500,375,
+            text="Ждем игроков...",
+            font=("Arial",50,"bold"),
+            fill="blue"
+        )
 
-    def move(self, e):
-        me = self.players.get(self.my_id, {"x": 150, "y": 80 if self.my_id=="0" else 120})
-        k = e.keysym.lower()
-        step = 15
+        # управление
+        self.bind("<KeyPress>", self.key_down)
+        self.bind("<KeyRelease>", self.key_up)
 
-        if self.my_id == "0": # WASD
-            if k == 'w': me['y'] -= step
-            if k == 's': me['y'] += step
-            if k == 'a': me['x'] -= step
-            if k == 'd': me['x'] += step
-        else: # Arrows
-            if k == 'up': me['y'] -= step
-            if k == 'down': me['y'] += step
-            if k == 'left': me['x'] -= step
-            if k == 'right': me['x'] += step
-        
-        self.sock.send(json.dumps(me).encode())
+        threading.Thread(target=self.listen,daemon=True).start()
+        self.update_loop()
+
+    def key_down(self,e):
+        self.pressed_keys.add(e.keysym.lower())
+
+    def key_up(self,e):
+        self.pressed_keys.discard(e.keysym.lower())
+
+    def start_countdown(self):
+        for i in range(3,0,-1):
+            self.cv.itemconfig(self.msg_label,text=str(i))
+            time.sleep(1)
+        self.cv.itemconfig(self.msg_label,text="GO!",fill="green")
+        self.game_started=True
+        pygame.mixer.music.load("mrg2.mp3")
+        pygame.mixer.music.play(-1)
+        time.sleep(1)
+        self.cv.itemconfig(self.msg_label,text="")
+
+    def is_on_road(self,x,y):
+        items=self.cv.find_overlapping(x,y,x,y)
+        return self.road in items
+
+    def rotate_car(self,pid,angle):
+        try:
+            orig=self.img_g if pid=="0" else self.img_y
+            rotated=orig.rotate(angle,expand=True)
+            new_tk=ImageTk.PhotoImage(rotated)
+            if pid=="0":
+                self.tk_g=new_tk
+                self.cv.itemconfig(self.p0,image=self.tk_g)
+            else:
+                self.tk_y=new_tk
+                self.cv.itemconfig(self.p1,image=self.tk_y)
+        except:
+            pass
+
+    def update_loop(self):
+        if self.game_started and not self.finished:
+            me = self.players_data.get(self.my_id, self.start_pos[self.my_id])
+            keys = self.pressed_keys
+
+            # движение
+            if self.my_id == "0":
+                if "w" in keys: self.vy -= self.speed; me["angle"] = 90
+                if "s" in keys: self.vy += self.speed; me["angle"] = 270
+                if "a" in keys: self.vx -= self.speed; me["angle"] = 180
+                if "d" in keys: self.vx += self.speed; me["angle"] = 0
+            else:
+                if "up" in keys: self.vy -= self.speed; me["angle"] = 90
+                if "down" in keys: self.vy += self.speed; me["angle"] = 270
+                if "left" in keys: self.vx -= self.speed; me["angle"] = 180
+                if "right" in keys: self.vx += self.speed; me["angle"] = 0
+
+            nx = me["x"] + self.vx
+            ny = me["y"] + self.vy
+
+            if self.is_on_road(nx, ny):
+                # зоны круга по порядку
+                if not self.zone_down and ny > 500:
+                    self.zone_down = True
+                if self.zone_down and not self.zone_right and nx > 750:
+                    self.zone_right = True
+                if self.zone_down and self.zone_right and not self.zone_up and ny < 300:
+                    self.zone_up = True
+
+                # финальная зона — только если пройдены все предыдущие
+                if self.zone_down and self.zone_right and self.zone_up:
+                    if 600 < nx < 900 and 450 < ny < 600:
+                        # проверка пересечения сверху вниз
+                        if self.prev_y < self.finish_y and ny >= self.finish_y:
+                            # круг засчитан
+                            self.laps += 1
+                            self.cv.itemconfig(self.lap_label,text=f"Круг: {self.laps}/{self.max_laps}")
+                            # сброс зон для следующего круга
+                            self.zone_down = False
+                            self.zone_right = False
+                            self.zone_up = False
+                            self.prev_y = ny
+                            if self.laps >= self.max_laps:
+                                self.finished = True
+                                me["finished"] = True
+                                pygame.mixer.music.stop()
+                                self.cv.itemconfig(self.msg_label,text="ФИНИШ!",fill="red")
+
+                me["x"] = nx
+                me["y"] = ny
+                self.prev_y = ny
+
+                try:
+                    self.sock.send(json.dumps(me).encode())
+                except:
+                    pass
+
+            # скольжение
+            self.vx *= self.friction
+            self.vy *= self.friction
+
+        self.after(30,self.update_loop)
 
     def listen(self):
         while True:
             try:
-                data = self.sock.recv(1024).decode()
+                data = self.sock.recv(2048).decode()
                 if not data: break
-                self.players = json.loads(data)
-                # Оновлюємо позиції
-                d0, d1 = self.players.get("0"), self.players.get("1")
-                if d0: self.cv.coords(self.p0, d0['x'], d0['y'])
-                if d1: self.cv.coords(self.p1, d1['x'], d1['y'])
-            except: break
-
-if __name__ == "__main__":
-    Game().mainloop()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-import customtkinter as ctk
-import socket
-import threading
-import json
-from PIL import Image, ImageTk
-
-# Однакові IP для сервера та гравця на одному ПК
-SERVER_IP = '127.0.0.1' 
-PORT = 5555
-
-class FastRace(ctk.CTk):
-    def __init__(self):
-        super().__init__()
-        self.title("Гонки: WASD vs Arrows")
-        self.geometry("1100x750")
-        
-        # 1. Підключення до сервера
-        try:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.connect((SERVER_IP, PORT))
-            self.my_id = self.sock.recv(1024).decode()
-            print(f"Ви підключилися як Гравець {int(self.my_id)+1}")
-        except:
-            print("ПОМИЛКА: Спочатку запустіть server.py!"); self.destroy(); return
-
-        self.players_data = {}
-        
-        # 2. Інтерфейс (Траса)
-        self.canvas = ctk.CTkCanvas(self, width=1050, height=700, bg="#222")
-        self.canvas.pack(pady=20)
-        
-        # Малюємо білу дорогу (рамку)
-        self.canvas.create_rectangle(50, 50, 1000, 650, outline="white", width=60)
-
-        # 3. Машинки
-        try:
-            # Спробуємо завантажити твої картинки
-            img1 = Image.open("МАШЫНА-removebg-preview.png").resize((50, 30))
-            self.photo1 = ImageTk.PhotoImage(img1)
-            img2 = Image.open("depositphotos_83377494-stock-illustration-yellow-car-top-view-removebg-preview.png").resize((50, 30))
-            self.photo2 = ImageTk.PhotoImage(img2)
-            
-            self.p0_sprite = self.canvas.create_image(150, 300, image=self.photo1)
-            self.p1_sprite = self.canvas.create_image(850, 300, image=self.photo2)
-        except:
-            # Якщо картинок немає, малюємо кольорові бокси
-            print("Картинки не знайдено, малюю замінники.")
-            self.p0_sprite = self.canvas.create_rectangle(130, 285, 170, 315, fill="green")
-            self.p1_sprite = self.canvas.create_rectangle(830, 285, 870, 315, fill="orange")
-
-        # 4. Події та мережа
-        self.bind("<KeyPress>", self.send_move)
-        threading.Thread(target=self.receive_loop, daemon=True).start()
-
-    def send_move(self, event):
-        # Отримуємо поточні координати (або ставимо дефолтні при старті)
-        me = self.players_data.get(self.my_id, {"x": 150 if self.my_id=="0" else 850, "y": 300})
-        
-        key = event.keysym.lower()
-        step = 18 # Швидкість руху
-
-        # Логіка для Гравця 1 (WASD)
-        if self.my_id == "0":
-            if key == 'w': me['y'] -= step
-            elif key == 's': me['y'] += step
-            elif key == 'a': me['x'] -= step
-            elif key == 'd': me['x'] += step
-        
-        # Логіка для Гравця 2 (Стрілочки)
-        elif self.my_id == "1":
-            if key == 'up': me['y'] -= step
-            elif key == 'down': me['y'] += step
-            elif key == 'left': me['x'] -= step
-            elif key == 'right': me['x'] += step
-        
-        # Відправляємо нові координати на сервер
-        try:
-            self.sock.send(json.dumps(me).encode())
-        except:
-            pass
-
-    def receive_loop(self):
-        while True:
-            try:
-                data = self.sock.recv(1024).decode()
-                if not data: break
-                self.players_data = json.loads(data)
-                
-                # Оновлюємо позиції обох машин на екрані
-                p0 = self.players_data.get("0")
-                p1 = self.players_data.get("1")
-                
-                if p0: self.canvas.coords(self.p0_sprite, p0['x'], p0['y'])
-                if p1: self.canvas.coords(self.p1_sprite, p1['x'], p1['y'])
+                if "START_GAME" in data:
+                    threading.Thread(target=self.start_countdown,daemon=True).start()
+                    continue
+                self.players_data.update(json.loads(data))
+                for pid,p in self.players_data.items():
+                    target = self.p0 if pid=="0" else self.p1
+                    self.cv.coords(target,p["x"],p["y"])
+                    self.rotate_car(pid,p.get("angle",0))
+                    if p.get("finished"):
+                        self.cv.itemconfig(self.msg_label,text=f"Игрок {int(pid)+1} победил!",fill="gold")
+                        self.finished = True
+                        pygame.mixer.music.stop()
             except:
                 break
 
-if __name__ == "__main__":
-    app = FastRace()
-    app.mainloop()
+if __name__=="__main__":
+    Game().mainloop()
